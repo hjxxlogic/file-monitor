@@ -1,0 +1,4 @@
+file_monitor
+monitor.log
+test_monitor.sh
+test_dir/file1.txt
