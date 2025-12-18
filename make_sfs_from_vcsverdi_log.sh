@@ -60,6 +60,58 @@ stage_vcs="${work_dir}/stage_vcs"
 stage_verdi="${work_dir}/stage_verdi"
 mkdir -p "${stage_vcs}" "${stage_verdi}"
 
+prepopulate_dirs_and_symlinks() {
+  local prefix="$1"
+  local dest_root="$2"
+
+  # 1) Create full directory structure (dirs only)
+  ( cd "${prefix}" && find . -type d -print0 ) | while IFS= read -r -d '' d; do
+    d="${d#./}"
+    [[ -z "${d}" ]] && continue
+    mkdir -p "${dest_root}/${d}"
+  done
+
+  # 2) Create all symlinks (preserve link target string)
+  ( cd "${prefix}" && find . -type l -print0 ) | while IFS= read -r -d '' l; do
+    l="${l#./}"
+    [[ -z "${l}" ]] && continue
+    target="$(readlink "${prefix}/${l}" 2>/dev/null || true)"
+    [[ -z "${target}" ]] && continue
+    mkdir -p "$(dirname "${dest_root}/${l}")"
+    rm -f "${dest_root}/${l}" 2>/dev/null || true
+    ln -s "${target}" "${dest_root}/${l}"
+  done
+}
+
+copy_rel_under_prefix() {
+  local prefix="$1"
+  local rel="$2"
+  local dest_root="$3"
+
+  ( cd "${prefix}" && cp -a -P --parents "${rel}" "${dest_root}" ) 2>/dev/null || true
+}
+
+copy_symlink_components_under_prefix() {
+  local prefix="$1"
+  local rel="$2"
+  local dest_root="$3"
+  local partial=""
+
+  IFS='/' read -r -a parts <<< "${rel}"
+  for part in "${parts[@]}"; do
+    [[ -z "${part}" ]] && continue
+    if [[ -z "${partial}" ]]; then
+      partial="${part}"
+    else
+      partial="${partial}/${part}"
+    fi
+
+    if [[ -L "${prefix}/${partial}" ]]; then
+      copy_rel_under_prefix "${prefix}" "${partial}" "${dest_root}"
+    fi
+  done
+}
+
 copy_one_under_prefix() {
   local prefix="$1"
   local src="$2"
@@ -72,13 +124,27 @@ copy_one_under_prefix() {
   esac
 
   if [[ -L "${src}" || -f "${src}" ]]; then
-    ( cd "${prefix}" && cp -a --parents "${rel}" "${dest_root}" ) 2>/dev/null || true
+    copy_symlink_components_under_prefix "${prefix}" "${rel}" "${dest_root}"
+    copy_rel_under_prefix "${prefix}" "${rel}" "${dest_root}"
+
+    if command -v realpath >/dev/null 2>&1; then
+      real_src="$(realpath "${src}" 2>/dev/null || true)"
+      if [[ -n "${real_src}" && "${real_src}" == "${prefix}"/* ]]; then
+        real_rel="${real_src#"${prefix}/"}"
+        copy_symlink_components_under_prefix "${prefix}" "${real_rel}" "${dest_root}"
+        copy_rel_under_prefix "${prefix}" "${real_rel}" "${dest_root}"
+      fi
+    fi
   fi
 }
 
 vcs_count=0
 verdi_count=0
 missing_count=0
+
+# Prepopulate staging with full dirs + all symlinks (not based on log)
+prepopulate_dirs_and_symlinks "/opt/vcs" "${stage_vcs}"
+prepopulate_dirs_and_symlinks "/opt/verdi" "${stage_verdi}"
 
 while IFS= read -r line || [[ -n "${line}" ]]; do
   p="${line%$'\r'}"

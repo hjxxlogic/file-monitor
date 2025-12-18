@@ -19,12 +19,14 @@
 #define EVENT_SIZE (sizeof(struct inotify_event))
 #define BUF_LEN (1024 * (EVENT_SIZE + 16))
 #define LOCK_FILE "/var/run/lock/file_monitor.lock"
+#define LOCK_FILE_FALLBACK "/tmp/file_monitor.lock"
 
 class FileMonitor {
 private:
     int fd;
-    std::map<int, std::string> watch_descriptors;
+    std::map<int, std::set<std::string>> watch_descriptors;
     std::set<std::string> watched_targets;
+    std::set<std::string> watched_paths;
     std::set<std::string> accessed_files;
     std::set<std::string> new_files;
     std::string log_file;
@@ -113,26 +115,44 @@ private:
 
         std::string watch_path = get_absolute_path_nofollow(path);
         std::string target_path = get_absolute_path(path);
+
+        bool should_recurse = true;
         if (watched_targets.find(target_path) != watched_targets.end()) {
-            return 0;
+            should_recurse = false;
         }
 
-        int wd = inotify_add_watch(fd, watch_path.c_str(), 
-            IN_ACCESS | IN_MODIFY | IN_OPEN | IN_CLOSE | 
-            IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_DONT_FOLLOW);
+        if (watched_paths.find(watch_path) != watched_paths.end()) {
+            should_recurse = false;
+        }
+
+        struct stat watch_lstat;
+        bool watch_is_symlink = (lstat(watch_path.c_str(), &watch_lstat) == 0 && S_ISLNK(watch_lstat.st_mode));
+
+        uint32_t mask = IN_ACCESS | IN_MODIFY | IN_OPEN | IN_CLOSE |
+                        IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO;
+        if (!watch_is_symlink) {
+            mask |= IN_DONT_FOLLOW;
+        }
+
+        int wd = inotify_add_watch(fd, watch_path.c_str(), mask);
         
         if (wd == -1) {
             std::cerr << "无法监控路径: " << watch_path << std::endl;
             return -1;
         }
 
-        watch_descriptors[wd] = watch_path;
-        watched_targets.insert(target_path);
+        watched_paths.insert(watch_path);
         if (!silent) {
             std::cout << "开始监控: " << watch_path << std::endl;
         }
 
+        watch_descriptors[wd].insert(watch_path);
+
         if (S_ISDIR(path_stat.st_mode)) {
+            if (should_recurse) {
+                watched_targets.insert(target_path);
+            }
+
             DIR* dir = opendir(watch_path.c_str());
             if (dir) {
                 struct dirent* entry;
@@ -144,7 +164,14 @@ private:
 
                     struct stat sub_stat;
                     if (stat(subpath.c_str(), &sub_stat) == 0 && S_ISDIR(sub_stat.st_mode)) {
-                        add_watch_recursive(subpath);
+                        if (should_recurse) {
+                            add_watch_recursive(subpath);
+                        } else if (watch_is_symlink) {
+                            struct stat sub_lst;
+                            if (lstat(subpath.c_str(), &sub_lst) == 0 && S_ISLNK(sub_lst.st_mode)) {
+                                add_watch_recursive(subpath);
+                            }
+                        }
                     }
                 }
                 closedir(dir);
@@ -217,17 +244,19 @@ public:
                     if (event->len > 0) {
                         auto it = watch_descriptors.find(event->wd);
                         if (it != watch_descriptors.end()) {
-                            std::string full_path = it->second + "/" + event->name;
-                            
-                            if (!(event->mask & IN_ISDIR)) {
-                                add_file_access(full_path);
-                                if (!silent) {
-                                    std::cout << "检测到文件访问: " << full_path << std::endl;
-                                }
-                            }
+                            for (const auto& base_path : it->second) {
+                                std::string full_path = base_path + "/" + event->name;
 
-                            if ((event->mask & IN_CREATE) && (event->mask & IN_ISDIR)) {
-                                add_watch_recursive(full_path);
+                                if (!(event->mask & IN_ISDIR)) {
+                                    add_file_access(full_path);
+                                    if (!silent) {
+                                        std::cout << "检测到文件访问: " << full_path << std::endl;
+                                    }
+                                }
+
+                                if ((event->mask & IN_CREATE) && (event->mask & IN_ISDIR)) {
+                                    add_watch_recursive(full_path);
+                                }
                             }
                         }
                     }
@@ -250,6 +279,7 @@ public:
 
 FileMonitor* g_monitor = nullptr;
 int g_lock_fd = -1;
+std::string g_lock_path;
 
 void signal_handler(int signum) {
     if (g_monitor) {
@@ -261,7 +291,11 @@ void cleanup_lock() {
     if (g_lock_fd != -1) {
         flock(g_lock_fd, LOCK_UN);
         close(g_lock_fd);
-        unlink(LOCK_FILE);
+        if (!g_lock_path.empty()) {
+            unlink(g_lock_path.c_str());
+        } else {
+            unlink(LOCK_FILE);
+        }
         g_lock_fd = -1;
     }
 }
@@ -269,19 +303,24 @@ void cleanup_lock() {
 bool acquire_lock() {
     // 尝试创建锁目录（如果不存在）
     mkdir("/var/run/lock", 0755);
-    
-    g_lock_fd = open(LOCK_FILE, O_CREAT | O_RDWR, 0644);
+
+    g_lock_path = LOCK_FILE;
+    g_lock_fd = open(g_lock_path.c_str(), O_CREAT | O_RDWR, 0644);
     if (g_lock_fd == -1) {
-        std::cerr << "错误: 无法创建锁文件 " << LOCK_FILE << std::endl;
-        std::cerr << "提示: 可能需要 root 权限，或使用其他目录" << std::endl;
-        return false;
+        g_lock_path = LOCK_FILE_FALLBACK;
+        g_lock_fd = open(g_lock_path.c_str(), O_CREAT | O_RDWR, 0644);
+        if (g_lock_fd == -1) {
+            std::cerr << "错误: 无法创建锁文件 " << LOCK_FILE << std::endl;
+            std::cerr << "提示: 可能需要 root 权限，或使用其他目录" << std::endl;
+            return false;
+        }
     }
     
     // 尝试获取排他锁（非阻塞）
     if (flock(g_lock_fd, LOCK_EX | LOCK_NB) == -1) {
         if (errno == EWOULDBLOCK) {
             std::cerr << "错误: 程序已经在运行中" << std::endl;
-            std::cerr << "锁文件: " << LOCK_FILE << std::endl;
+            std::cerr << "锁文件: " << g_lock_path << std::endl;
             
             // 尝试读取锁文件中的PID
             char pid_buf[32];
@@ -295,6 +334,7 @@ bool acquire_lock() {
         }
         close(g_lock_fd);
         g_lock_fd = -1;
+        g_lock_path.clear();
         return false;
     }
     

@@ -4,3 +4,4 @@ test_monitor.sh
 test_dir/file1.txt
 *.sfs
 *.log
+verdiLog/novas_autosave.ses.config
